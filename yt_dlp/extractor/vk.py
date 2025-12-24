@@ -13,7 +13,6 @@ from ..utils import (
     UserNotLive,
     clean_html,
     get_element_by_class,
-    get_element_html_by_id,
     int_or_none,
     join_nonempty,
     parse_qs,
@@ -26,7 +25,6 @@ from ..utils import (
     update_url_query,
     url_or_none,
     urlencode_postdata,
-    urljoin,
 )
 from ..utils.traversal import require, traverse_obj
 
@@ -748,22 +746,88 @@ class VKWallPostIE(VKBaseIE):
 
     def _real_extract(self, url):
         post_id = self._match_id(url)
+        access_token = self._configuration_arg('access_token')
+        # 仮
+        if not access_token:
+            raise ExtractorError('No access token provided')
+        access_token = access_token[0]
 
-        webpage = self._download_payload('wkview', post_id, {
-            'act': 'show',
-            'w': 'wall' + post_id,
-        })[1]
+        webpage = self._download_webpage(url, post_id)
+        playlist_id, owner_id = self._search_regex(r'audio_playlist["\']\s*:\s*\{.*?"id"\s*:\s*(\d+).*?"owner_id"\s*:\s*(-?\d+)',
+                                                   webpage,
+                                                   'id and owner_id',
+                                                   group=(1, 2),
+                                                   )
 
-        uploader = clean_html(get_element_by_class('PostHeaderTitle__authorName', webpage))
+        access_key = self._search_regex(
+            r'subtitle_badge.*?"access_key"\s*:\s*"([^"]+)"',
+            webpage,
+            'access_key',
+            flags=re.DOTALL,
+        )
 
+        new_token = self._download_json('https://login.vk.com/',
+                                        post_id,
+                                        headers={'Host': 'login.vk.com',
+                                                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:146.0) Gecko/20100101 Firefox/146.0',
+                                                 'Accept': '*/*',
+                                                 'Accept-Language': 'ja,en-US;q=0.7,en;q=0.3',
+                                                 'Accept-Encoding': 'gzip, deflate, br, zstd',
+                                                 'Referer': 'https://vk.com/',
+                                                 'Content-Type': 'application/x-www-form-urlencoded',
+                                                 'Origin': 'https://vk.com',
+                                                 'Connection': 'keep-alive',
+                                                 'Sec-Fetch-Dest': 'empty',
+                                                 'Sec-Fetch-Mode': 'cors',
+                                                 'Sec-Fetch-Site': 'same-site',
+                                                 'Priority': 'u=4',
+                                                 'Pragma': 'no-cache',
+                                                 'Cache-Control': 'no-cache'},
+                                        query={
+                                            'act': 'web_token'},
+                                        data=(
+                                            ('version=1'
+                                             '&app_id=6287487'
+                                             f'&access_token={access_token}').encode()
+                                        ),
+                                        )['data']['access_token']
+
+        playlistinfo = self._download_json(
+            'https://api.vk.com/method/audio.getIdsBySource',
+            post_id,
+            query={'v': '5.269', 'client_id': '6287487'},
+            data=urlencode_postdata({
+                'source': 'playlist',
+                'ref': '',
+                'entity_id': f'{owner_id}_{playlist_id}_{access_key}',
+                'access_token': new_token,
+            }),
+        )
+
+        audio_ids = []
+        for audio in playlistinfo['response']['audios']:
+            audio_ids.append(audio['audio_id'])
+
+        trackinfos = self._download_json(
+            'https://api.vk.com/method/audio.getById',
+            post_id,
+            query={'v': '5.269', 'client_id': '6287487'},
+            data=urlencode_postdata({'audios': ','.join(audio_ids), 'access_token': new_token}),
+        )['response']
+
+        uploader = clean_html(get_element_by_class('author', webpage))
         entries = []
 
-        for audio in re.findall(r'data-audio="([^"]+)', webpage):
-            audio = self._parse_json(unescapeHTML(audio), post_id)
-            if not audio['url']:
-                continue
-            title = unescapeHTML(audio.get('title'))
-            artist = unescapeHTML(audio.get('artist'))
+        for audio in trackinfos:
+            title = audio['title']
+            artist = audio['artist']
+            formats = self._extract_m3u8_formats(
+                audio['url'],
+                audio['id'],
+                'm4a',
+                'm3u8_native',
+                m3u8_id='hls',
+            )
             entries.append({
                 'id': f'{audio["owner_id"]}_{audio["id"]}',
                 'title': join_nonempty(artist, title, delim=' - '),
@@ -772,22 +836,12 @@ class VKWallPostIE(VKBaseIE):
                 'uploader': uploader,
                 'artist': artist,
                 'track': title,
-                'formats': [{
-                    'url': audio['url'],
-                    'ext': 'm4a',
-                    'vcodec': 'none',
-                    'acodec': 'mp3',
-                    'container': 'm4a_dash',
-                }],
+                'formats': formats,
             })
-
-        entries.extend(self.url_result(urljoin(url, entry), VKIE) for entry in set(re.findall(
-            r'<a[^>]+href=(?:["\'])(/video(?:-?[\d_]+)[^"\']*)',
-            get_element_html_by_id('wl_post_body', webpage))))
 
         return self.playlist_result(
             entries, post_id, join_nonempty(uploader, f'Wall post {post_id}', delim=' - '),
-            clean_html(get_element_by_class('wall_post_text', webpage)))
+            '仮')
 
 
 class VKPlayBaseIE(InfoExtractor):
